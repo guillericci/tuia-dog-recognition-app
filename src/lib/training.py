@@ -42,7 +42,7 @@ class TrainConfig:
     max_batches: int | None = None    # solo para pruebas rápidas (smoke test)
     tag: str = "resnet18_finetuned"   # nombre del historial
     save_as_active: bool = True       # False: guarda en output/<tag>.pth y no pisa el checkpoint de la app
-
+    model_kwargs: dict | None = None  # argumentos extra del constructor del modelo
 
 def set_seed(seed: int) -> None:
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -130,6 +130,8 @@ def run_training(build_model: Callable[[list[str]], nn.Module], cfg: TrainConfig
         groups = [{"params": head, "lr": cfg.lr_head}]
     elif cfg.strategy == "finetune":
         groups = [{"params": head, "lr": cfg.lr_head}, {"params": back, "lr": cfg.lr_backbone}]
+    elif cfg.strategy == "scratch":      # sin preentrenamiento: todo el modelo con un único lr (lr_head)
+        groups = [{"params": head + back, "lr": cfg.lr_head}]
     else:
         raise ValueError(f"strategy desconocida: {cfg.strategy!r}")
     optimizer = torch.optim.AdamW(groups, weight_decay=cfg.weight_decay)
