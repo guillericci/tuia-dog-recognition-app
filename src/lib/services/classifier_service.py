@@ -88,29 +88,28 @@ class ClassifierService:
     # ------------------------------------------------------------------
     def train_classifier(self) -> None:
         """Entrena el modelo activo. Hiperparámetros: `self.train_config` (dict opcional, ver TrainConfig)."""
-        from lib.models.resnet_classifier import BreedResNet
         from lib.training import TrainConfig, run_training
 
-        cfg = TrainConfig(**getattr(self, "train_config", {}))
-        if self.active_model_name != "resnet18_finetuned":
-            raise NotImplementedError("cnn_custom se implementa en el siguiente paso (Modelo B).")
-
-        data_root = self.dataset_path.parent                      # DATA_PATH: las rutas de los splits son "dataset/..."
-        for cand in (data_root / "splits", self.output_path / "splits"):
-            if (cand / "train.csv").exists():
-                splits_dir = cand
-                break
+        cfg = TrainConfig(**{"tag": self.active_model_name, **getattr(self, "train_config", {})})
+        if self.active_model_name == "resnet18_finetuned":
+            from lib.models.resnet_classifier import BreedResNet
+            build = lambda classes: BreedResNet(classes, pretrained=True, dropout=cfg.dropout)
+        elif self.active_model_name == "cnn_custom":
+            from lib.models.cnn_custom import BreedCNN
+            emb_dim = getattr(self, "embedding_dim", 512)          # debe coincidir con EMBEDDING_DIM
+            build = lambda classes: BreedCNN(classes, embedding_dim=emb_dim, dropout=cfg.dropout,
+                                             **(cfg.model_kwargs or {}))
         else:
-            raise FileNotFoundError("No encuentro train.csv: copiá los splits a data/splits/ (ver 1-pre-processing).")
+            raise ValueError(f"Modelo desconocido: {self.active_model_name!r}")
 
+        data_root = self.dataset_path.parent
+        splits_dir = self._find_splits_dir()
         ckpt = self.active_checkpoint if cfg.save_as_active else self.output_path / f"{cfg.tag}.pth"
-        run_training(
-            build_model=lambda classes: BreedResNet(classes, pretrained=True, dropout=cfg.dropout),
-            cfg=cfg, splits_dir=splits_dir, data_root=data_root, image_size=self.image_size,
-            checkpoint_path=ckpt, history_path=self.output_path / f"history_{cfg.tag}.json",
-        )    
+        run_training(build_model=build, cfg=cfg, splits_dir=splits_dir, data_root=data_root,
+                     image_size=self.image_size, checkpoint_path=ckpt,
+                     history_path=self.output_path / f"history_{cfg.tag}.json")
         if cfg.save_as_active:
-            self._loaded.pop(self.active_model_name, None) 
+            self._loaded.pop(self.active_model_name, None)
             
     def evaluate_classifier(self) -> dict[str, float]:
         """Evalúa el modelo activo sobre `test` (splits de 1-pre-processing)."""
