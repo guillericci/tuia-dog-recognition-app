@@ -82,21 +82,43 @@ class ClassifierService:
     # ------------------------------------------------------------------
     # Etapa 2: funciones a implementar
     # ------------------------------------------------------------------
-
     def train_classifier(self) -> None:
-        """
-        Entrena el clasificador de razas sobre el dataset (self.dataset_path).
+        """Entrena el modelo activo. Hiperparámetros: `self.train_config` (dict opcional, ver TrainConfig)."""
+        from lib.models.resnet_classifier import BreedResNet
+        from lib.training import TrainConfig, run_training
 
-        Modelo A (obligatorio): fine-tuning de ResNet18 (o ResNet50) pre-entrenado.
-        Modelo B (obligatorio): CNN propia.
+        cfg = TrainConfig(**getattr(self, "train_config", {}))
+        if self.active_model_name != "resnet18_finetuned":
+            raise NotImplementedError("cnn_custom se implementa en el siguiente paso (Modelo B).")
 
-        Debe:
-          - Usar los splits train/valid definidos en 1-pre-processing.ipynb.
-          - Aplicar el preprocesamiento y data augmentation justificados.
-          - Guardar el checkpoint resultante en self.active_checkpoint
-            (ej: models/resnet18_finetuned.pth).
-        """
-        raise NotImplementedError("Etapa 2: implementar train_classifier")
+        data_root = self.dataset_path.parent                      # DATA_PATH: las rutas de los splits son "dataset/..."
+        for cand in (data_root / "splits", self.output_path / "splits"):
+            if (cand / "train.csv").exists():
+                splits_dir = cand
+                break
+        else:
+            raise FileNotFoundError("No encuentro train.csv: copiá los splits a data/splits/ (ver 1-pre-processing).")
+
+        ckpt = self.active_checkpoint if cfg.save_as_active else self.output_path / f"{cfg.tag}.pth"
+        run_training(
+            build_model=lambda classes: BreedResNet(classes, pretrained=True, dropout=cfg.dropout),
+            cfg=cfg, splits_dir=splits_dir, data_root=data_root, image_size=self.image_size,
+            checkpoint_path=ckpt, history_path=self.output_path / f"history_{cfg.tag}.json",
+        )    
+    # def train_classifier(self) -> None:
+    #     """
+    #     Entrena el clasificador de razas sobre el dataset (self.dataset_path).
+
+    #     Modelo A (obligatorio): fine-tuning de ResNet18 (o ResNet50) pre-entrenado.
+    #     Modelo B (obligatorio): CNN propia.
+
+    #     Debe:
+    #       - Usar los splits train/valid definidos en 1-pre-processing.ipynb.
+    #       - Aplicar el preprocesamiento y data augmentation justificados.
+    #       - Guardar el checkpoint resultante en self.active_checkpoint
+    #         (ej: models/resnet18_finetuned.pth).
+    #     """
+    #     raise NotImplementedError("Etapa 2: implementar train_classifier")
 
     def evaluate_classifier(self) -> dict[str, float]:
         """
