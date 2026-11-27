@@ -11,6 +11,9 @@ import numpy as np
 from lib.schemas import ClassifyResult, DetectResult, DogDetection
 from lib.services.classifier_service import ClassifierService
 
+import torch
+from lib.preprocessing import preprocess_to_tensor
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,30 +64,40 @@ class DetectionService:
     # ------------------------------------------------------------------
     # Etapa 3: funciones a implementar
     # ------------------------------------------------------------------
+    def _detector(self):
+        """YOLO preentrenado en COCO, cargado una sola vez (los pesos se descargan en el primer uso)."""
+        det = getattr(self, "_yolo", None)
+        if det is None:
+            from ultralytics import YOLO
+            det = YOLO(self.yolo_model_name)
+            self._yolo = det
+        return det
 
     def detect_dogs(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], float]]:
         """
         Detecta todos los perros presentes en la imagen usando un modelo YOLO
         pre-entrenado (ej: YOLOv8n via ultralytics). No es necesario entrenar
-        el detector.
-
-        Sugerencias:
-          - self.yolo_model_name, self.conf_threshold y self.dog_class_id
-            (clase 'dog' = 16 en COCO) vienen de la configuracion (.env).
-          - Debe funcionar con un perro, multiples perros y escenas complejas.
-
-        Retorna una lista de ((x1, y1, x2, y2), confidence) en pixeles.
-        """
-        raise NotImplementedError("Etapa 3: implementar detect_dogs")
+        el detector.""" 
+        result = self._detector().predict(
+            image, conf=self.conf_threshold, classes=[self.dog_class_id], verbose=False)[0]
+        detections = []
+        for box in result.boxes:
+            x1, y1, x2, y2 = (int(round(v)) for v in box.xyxy[0].tolist())
+            detections.append(((x1, y1, x2, y2), float(box.conf[0])))
+        detections.sort(key=lambda d: d[1], reverse=True)
+        return detections
 
     def classify_detected_dog(self, crop: np.ndarray) -> tuple[str, float]:
-        """
-        Clasifica la raza del recorte de un perro detectado usando el modelo
-        entrenado en la Etapa 2 (self.classifier.load_model()).
-
-        El recorte llega en BGR (OpenCV). Retorna (raza, score).
-        """
-        raise NotImplementedError("Etapa 3: implementar classify_detected_dog")
+        """Clasifica la raza del recorte de un perro detectado usando el modelo entrenado en la Etapa 2 (self.classifier.load_model()).
+        El recorte llega en BGR (OpenCV). Retorna (raza, score)."""
+        model = self.classifier.load_model()
+        if not isinstance(model, torch.nn.Module):
+            raise NotImplementedError("Este flujo usa checkpoints .pth (modelo completo de PyTorch).")
+        model.eval()
+        with torch.no_grad():
+            probs = torch.softmax(model(preprocess_to_tensor(crop, self.classifier.image_size)).float(), dim=1)[0]
+        idx = int(probs.argmax())
+        return model.classes[idx], float(probs[idx])
 
     # ------------------------------------------------------------------
     # Orquestacion provista
