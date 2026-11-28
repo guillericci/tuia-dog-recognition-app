@@ -8,6 +8,10 @@ import numpy as np
 import torch
 import onnxruntime
 
+import cv2
+import pandas as pd
+from lib.preprocessing import preprocess_to_tensor
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,44 +86,107 @@ class ClassifierService:
     # ------------------------------------------------------------------
     # Etapa 2: funciones a implementar
     # ------------------------------------------------------------------
-
     def train_classifier(self) -> None:
-        """
-        Entrena el clasificador de razas sobre el dataset (self.dataset_path).
+        """Entrena el modelo activo. Hiperparámetros: `self.train_config` (dict opcional, ver TrainConfig)."""
+        from lib.training import TrainConfig, run_training
 
-        Modelo A (obligatorio): fine-tuning de ResNet18 (o ResNet50) pre-entrenado.
-        Modelo B (obligatorio): CNN propia.
+        cfg = TrainConfig(**{"tag": self.active_model_name, **getattr(self, "train_config", {})})
+        if self.active_model_name == "resnet18_finetuned":
+            from lib.models.resnet_classifier import BreedResNet
+            build = lambda classes: BreedResNet(classes, pretrained=True, dropout=cfg.dropout)
+        elif self.active_model_name == "cnn_custom":
+            from lib.models.cnn_custom import BreedCNN
+            emb_dim = getattr(self, "embedding_dim", 512)          # debe coincidir con EMBEDDING_DIM
+            build = lambda classes: BreedCNN(classes, embedding_dim=emb_dim, dropout=cfg.dropout,
+                                             **(cfg.model_kwargs or {}))
+        else:
+            raise ValueError(f"Modelo desconocido: {self.active_model_name!r}")
 
-        Debe:
-          - Usar los splits train/valid definidos en 1-pre-processing.ipynb.
-          - Aplicar el preprocesamiento y data augmentation justificados.
-          - Guardar el checkpoint resultante en self.active_checkpoint
-            (ej: models/resnet18_finetuned.pth).
-        """
-        raise NotImplementedError("Etapa 2: implementar train_classifier")
-
+        data_root = self.dataset_path.parent
+        splits_dir = self._find_splits_dir()
+        ckpt = self.active_checkpoint if cfg.save_as_active else self.output_path / f"{cfg.tag}.pth"
+        run_training(build_model=build, cfg=cfg, splits_dir=splits_dir, data_root=data_root,
+                     image_size=self.image_size, checkpoint_path=ckpt,
+                     history_path=self.output_path / f"history_{cfg.tag}.json")
+        if cfg.save_as_active:
+            self._loaded.pop(self.active_model_name, None)
+            
     def evaluate_classifier(self) -> dict[str, float]:
-        """
-        Evalua el modelo activo sobre el conjunto de prueba.
-
-        Debe reportar: accuracy, precision, recall (sensibilidad),
-        specificity (especificidad) y F1-Score. La matriz de confusion y las
-        curvas de entrenamiento se documentan en 2-train.ipynb.
-
-        Retorna un dict con las metricas, ej:
-          {"accuracy": 0.91, "precision": 0.90, "recall": 0.89,
-           "specificity": 0.99, "f1": 0.90}
-        """
-        raise NotImplementedError("Etapa 2: implementar evaluate_classifier")
+        """Evalúa el modelo activo sobre `test` (splits de 1-pre-processing)."""
+        d = pd.read_csv(self._find_splits_dir() / "test.csv")
+        data_root = self.dataset_path.parent
+        return self.evaluate_paths([data_root / p for p in d.path], d.breed.tolist(), name="test")
 
     def extract_custom_embedding(self, image: np.ndarray) -> list[float]:
-        """
-        Genera el embedding de una imagen usando el modelo propio activo
-        (penultima capa del ResNet18 fine-tuned o de la CNN custom).
+        """Embedding (capa previa al clasificador) de una imagen BGR uint8, normalizado L2."""
+        model = self._inference_model()
+        with torch.no_grad():
+            emb = model.embed(preprocess_to_tensor(image, self.image_size))[0].float()
+            emb = torch.nn.functional.normalize(emb, dim=0)
+        return emb.tolist()
+    
+    # ------------------------------------------------------------------
+    # Auxiliares de inferencia y evaluación
+    # ------------------------------------------------------------------
+    def _find_splits_dir(self) -> Path:
+        for cand in (self.dataset_path.parent / "splits", self.output_path / "splits"):
+            if (cand / "train.csv").exists():
+                return cand
+        raise FileNotFoundError("No encuentro los splits: copiá train/valid/test.csv a data/splits/.")
 
-        Se usa cuando EMBEDDING_MODEL != baseline para que la busqueda por
-        similitud (Etapa 1) funcione con los modelos entrenados.
-        La imagen llega en BGR (OpenCV). Retorna una lista de floats de
-        dimension EMBEDDING_DIM.
-        """
-        raise NotImplementedError("Etapa 2: implementar extract_custom_embedding")
+    def _inference_model(self):
+        model = self.load_model()
+        if not isinstance(model, torch.nn.Module):
+            raise NotImplementedError("Este flujo usa checkpoints .pth (modelo completo de PyTorch).")
+        return model.eval()
+
+    def _predict_paths(self, paths: list[Path], batch_size: int = 64) -> np.ndarray:
+        """Probabilidades (N, C) del modelo activo con el mismo preprocesamiento que la app."""
+        model = self._inference_model()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        out = []
+        try:
+            model.to(device)
+            with torch.no_grad():
+                for s in range(0, len(paths), batch_size):
+                    batch = []
+                    for p in paths[s:s + batch_size]:
+                        img = cv2.imread(str(p))
+                        if img is None:
+                            raise RuntimeError(f"No se pudo leer {p}")
+                        batch.append(preprocess_to_tensor(img, self.image_size))
+                    logits = model(torch.cat(batch).to(device))
+                    out.append(torch.softmax(logits.float(), dim=1).cpu().numpy())
+        finally:
+            model.to("cpu")            # el modelo cacheado queda en CPU, como espera la app
+        return np.concatenate(out)
+
+    @staticmethod
+    def _metrics_from_predictions(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> dict[str, float]:
+        from lib.evaluation.metrics import precision_recall_f1, specificity
+        cm = np.bincount(y_true * n_classes + y_pred, minlength=n_classes ** 2).reshape(n_classes, n_classes)
+        tp = np.diag(cm)
+        fp, fn = cm.sum(0) - tp, cm.sum(1) - tp
+        tn = cm.sum() - tp - fp - fn
+        present = np.flatnonzero(cm.sum(1) > 0)           # solo clases con imágenes reales en este conjunto
+        prf = np.array([precision_recall_f1(int(tp[c]), int(fp[c]), int(fn[c])) for c in present])
+        spec = [specificity(int(tn[c]), int(fp[c])) for c in present]
+        return {"accuracy": float(tp.sum() / cm.sum()), "precision": float(prf[:, 0].mean()),
+                "recall": float(prf[:, 1].mean()), "specificity": float(np.mean(spec)),
+                "f1": float(prf[:, 2].mean())}
+
+    def evaluate_paths(self, paths: list[Path], breeds: list[str], name: str = "custom") -> dict[str, float]:
+        """Evalúa el modelo activo sobre cualquier lista de imágenes con su raza (test, independiente...).
+        Guarda predicciones y probabilidades en self.last_eval['<modelo>:<name>'] para el análisis de errores."""
+        model = self._inference_model()
+        idx = {c: i for i, c in enumerate(model.classes)}          # mapeo que viaja dentro del modelo
+        y_true = np.array([idx[b] for b in breeds])                # KeyError si una raza no existe en el modelo
+        probs = self._predict_paths(paths)
+        y_pred = probs.argmax(1)
+        if not hasattr(self, "last_eval"):
+            self.last_eval = {}
+        self.last_eval[f"{self.active_model_name}:{name}"] = {
+            "paths": [str(p) for p in paths], "y_true": y_true, "y_pred": y_pred,
+            "probs": probs, "classes": list(model.classes)}
+        return self._metrics_from_predictions(y_true, y_pred, len(model.classes))
+
